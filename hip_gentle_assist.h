@@ -3,7 +3,10 @@
  * 输入左右髋角度，内部跟踪角度差的相位，以公共波形生成双髋力矩（N·m）。
  * 公共波形经限幅、限速后左右反向输出；默认伸展与屈曲等幅。
  * 首腿动作仅用于学习相位，确认另一腿开始抬起后才从零渐入助力。
- * 起步定频允许在进入TRACK后的两个有效完整半周期内纠偏，之后恢复正常失配检查。
+ * 首次峰值回落到过零时，若观测频率比初值快20%以上且在允许范围内，提前纠正偏慢初值；
+ * 较慢回落不据此降低初值，首次助力无需等整个半周期结束才得到纠偏。
+ * 起步在进入TRACK后的两个有效完整半周期内，频率偏差超过20%时直接纠频；
+ * 相位未失配时沿原限速对齐，不因普通纠频重启渐入；窗口结束恢复正常跟踪。
  *
  * 力矩设置：大摆幅上限由 ASSIST_GENTLE_ADAPTIVE_MAX_NM 设置，默认8 N·m；
  * 小摆幅取上限的 ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT，默认50%（4 N·m）。
@@ -17,8 +20,11 @@
  * 起步校准中的短停恢复会按当前半波进度估频，下一真实过零再用完整半周期校正；
  * 正常恢复不重启全局渐入，校准结束后仍执行原相位失配保护。
  * 已确认的长HOLD可零力矩不限时等待；落腿恢复后有限重校准。中立站稳等停止条件仍有效。
- * 普通低速卸力默认至少240ms；卸力期间若同向复动满足速度/时间和0.05rad新位移，
- * 从剩余力矩平滑接回；方向变化、弱峰及相位暂停仍先归零，无有效复动则持续卸力至零。
+ * 普通低速衔接使用原默认240ms归零预算：增长中的力矩可有限保持，再按剩余预算卸力。
+ * 实际同向速度确认后，位移不足时仅保持余力；达到0.05rad净位移后才平滑增加助力。
+ * 未确认复动不延长归零期限；目标换向、明确反向运动、弱峰及悬停会提前结束保持。
+ * 普通卸力中若余力不超过0.05N·m，且目标与实际运动均已确认换向，则按限速及时归零，
+ * 不再等待完整卸力窗口；确认结束的旧方向不能因目标反弹而重新接回。
  * 普通停顿平滑卸力；正式EXIT沿限速归零，故障/无效输入复位清零。
  * 2秒无进展超时不是半步完成期限，也不是已确认长HOLD的等待上限。
  *
@@ -189,6 +195,8 @@
 #define HIP_GENTLE_HISTORY_CAPACITY 64U
 #define HIP_GENTLE_HARMONICS 5U
 #define HIP_GENTLE_PEAK_HISTORY_CAPACITY 2U // 每个方向各自保存，总计4个半波
+#define HIP_GENTLE_REVERSAL_RESIDUAL_NM 0.05 // 确认换向后可快速归零的微小余力上限，N·m
+#define HIP_GENTLE_STARTUP_FREQUENCY_TOLERANCE 0.20 // 起步整半周期频率偏差超过20%才主动纠偏
 #define HIP_GENTLE_STARTUP_SYNC_HALVES 2U // 首次校准观察完整左右周期，避免只验证较快一侧
 #define HIP_GENTLE_RESUME_SYNC_HALVES 4U // 悬停恢复后用两个完整周期重新确认频率
 
@@ -270,8 +278,8 @@ typedef struct {
     double direction_wait_s; // 等实际方向许可的时间，不含正常跨零卸力
     bool phase_paused, pause_used_this_half; // 短停与长HOLD共用暂停状态；每半波限制短停重入
     double motion_entry_elapsed, motion_release_elapsed, motion_release_duration, motion_release_torque;
-    bool motion_release_resumable;
-    double motion_release_x, motion_entry_torque;
+    bool motion_release_resumable, motion_release_reversing;
+    double motion_release_x, motion_entry_torque, motion_release_hold_s; // 保持结束时刻相对本次卸力起点，s
     double torque_rate_nm_s, motion_release_rate; // 卸力衔接保留已有的回零速度
     double time_s, previous_x, peak, last_peak, cross_time, peak_time, event_time;
     double progress_time, progress_x;
