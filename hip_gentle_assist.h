@@ -10,11 +10,15 @@
  * 判档使用角度差的AFO第一谐波幅值，不是瞬时角度差或速度；0.60 rad升档、0.50 rad降档，
  * 中间保持原档位，幅值平滑过渡。幅值是波形上限，并非每一步都必须达到的实际力矩。
  *
- * 暂停与恢复：稳定跟踪、启动渐入完成、非弱峰候选且仍处于抬腿姿态时，
+ * 暂停与恢复：TRACK中启动渐入完成、非弱峰候选且仍处于抬腿姿态时（含起步定频校准期），
  * 零力矩下若下一回落方向未确认，相对低速达30ms或该方向等待达50ms，进入短暂停。
  * 暂停时冻结预测相位，实际回落确认或真实过零后，在零力矩帧对齐相位，再平滑接入。
  * 短暂停保留两腿确认和幅值档位；不增加踱步、下楼等场景识别。
+ * 起步校准中的短停恢复会按当前半波进度估频，下一真实过零再用完整半周期校正；
+ * 正常恢复不重启全局渐入，校准结束后仍执行原相位失配保护。
  * 已确认的长HOLD可零力矩不限时等待；落腿恢复后有限重校准。中立站稳等停止条件仍有效。
+ * 普通低速卸力默认至少240ms；卸力期间若同向复动满足速度/时间和0.05rad新位移，
+ * 从剩余力矩平滑接回；方向变化、弱峰及相位暂停仍先归零，无有效复动则持续卸力至零。
  * 普通停顿平滑卸力；正式EXIT沿限速归零，故障/无效输入复位清零。
  * 2秒无进展超时不是半步完成期限，也不是已确认长HOLD的等待上限。
  *
@@ -266,6 +270,8 @@ typedef struct {
     double direction_wait_s; // 等实际方向许可的时间，不含正常跨零卸力
     bool phase_paused, pause_used_this_half; // 短停与长HOLD共用暂停状态；每半波限制短停重入
     double motion_entry_elapsed, motion_release_elapsed, motion_release_duration, motion_release_torque;
+    bool motion_release_resumable;
+    double motion_release_x, motion_entry_torque;
     double torque_rate_nm_s, motion_release_rate; // 卸力衔接保留已有的回零速度
     double time_s, previous_x, peak, last_peak, cross_time, peak_time, event_time;
     double progress_time, progress_x;

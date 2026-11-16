@@ -234,7 +234,17 @@ static void release_motion_torque(hip_gentle_assist_t *s, double dt)
     if (!s->motion_releasing) {
         s->motion_release_torque = s->torque;
         s->motion_release_elapsed = 0;
-        s->motion_release_duration = fmax(s->parameters.motion_fall_s,
+        s->motion_release_x = s->previous_x;
+        s->motion_release_resumable = s->state == HIP_GENTLE_TRACK && s->startup_released &&
+            !s->weak_pending && !s->phase_paused &&
+            s->hold_quiet_time < s->parameters.hold_confirm_s*.5 &&
+            s->quiet_time+1e-12 >= s->parameters.low_speed_release_confirm_s;
+        /* 普通低速撤力覆盖渐入与复动确认时间，衔接下限最多240ms；停止仍持续卸力。 */
+        const double fall = s->motion_release_resumable ?
+            fmax(s->parameters.motion_fall_s, fmin(s->parameters.motion_rise_s+
+                s->parameters.low_speed_release_confirm_s+s->parameters.reversal_confirm_s, .24)) :
+            s->parameters.motion_fall_s;
+        s->motion_release_duration = fmax(fall,
             1.5*fabs(s->torque)/s->parameters.slew_nm_s);
         const double sign = s->torque > 0 ? 1 : -1;
         /* Hermite初始斜率限制在回零方向，归一化幅度不超过3，保证单调且不越零。 */
@@ -325,6 +335,16 @@ static void apply_motion_target(hip_gentle_assist_t *s, double target, double dt
     if (direction && direction != s->torque_direction && s->torque == 0 && !confirmed)
         s->direction_wait_s += dt;
     const bool interrupted = s->motion_ramp_pending || s->motion_releasing;
+    /* 仅普通低速卸力允许同向接回；换向、弱峰和相位暂停仍先归零。 */
+    if (s->motion_releasing && s->motion_release_resumable && s->torque*target > 0 &&
+        confirmed && direction != s->completed_direction && !s->weak_pending && !s->phase_paused &&
+        s->hold_quiet_time < s->parameters.hold_confirm_s*.5 &&
+        direction*(s->previous_x-s->motion_release_x) >= s->parameters.startup_lift_angle_rad) {
+        s->torque_direction = direction; s->motion_waiting = false;
+        s->motion_releasing = s->motion_ramp_pending = false;
+        s->motion_entry_torque = s->torque; s->motion_entry_elapsed = 0;
+        s->paused_direction = 0; s->direction_wait_s = 0;
+    }
     /* 获准但尚未出力就换相，也要结束该许可，不能依赖微小脉冲解锁下一方向。 */
     if (s->torque == 0 && s->torque_direction && direction && direction != s->torque_direction) {
         s->completed_direction = s->torque_direction;
@@ -345,6 +365,7 @@ static void apply_motion_target(hip_gentle_assist_t *s, double target, double dt
             s->motion_waiting = false;
             const bool late_entry = fabs(target) > s->parameters.slew_nm_s*dt ||
                 s->direction_wait_s+1e-12 >= s->parameters.reversal_confirm_s;
+            s->motion_entry_torque = 0;
             s->motion_entry_elapsed = s->motion_ramp_pending || late_entry ? 0 : s->parameters.motion_rise_s;
             s->motion_ramp_pending = false; s->direction_wait_s = 0;
         } else {
@@ -362,7 +383,7 @@ static void apply_motion_target(hip_gentle_assist_t *s, double target, double dt
     } else {
         const double gain = smooth_fraction(s->motion_entry_elapsed/s->parameters.motion_rise_s);
         s->motion_entry_elapsed = fmin(s->parameters.motion_rise_s, s->motion_entry_elapsed+dt);
-        apply_target(s, target*gain, dt);
+        apply_target(s, s->motion_entry_torque+(target-s->motion_entry_torque)*gain, dt);
     }
     if (previous_torque != 0 && s->torque == 0) {
         const int previous_direction = previous_torque > 0 ? 1 : -1;
@@ -412,6 +433,13 @@ static void resume_phase_pause(hip_gentle_assist_t *s, double x)
             s->phases[k] = wrap(s->phases[k]+(k+1)*correction);
         memset(s->rates, 0, sizeof(s->rates));
         s->phase = phase; s->phase_correction = 0;
+        if (!held && s->bootstrap_halves_remaining) {
+            /* 起步停顿后先按已走过的半波进度估频，下次真实过零再用完整半周期校正。 */
+            const double elapsed = s->time_s-s->event_time;
+            const double omega = elapsed > 0 ? wrap(phase-(s->direction > 0 ? 0 : PI))/elapsed : 0;
+            if (omega >= TAU*p->min_frequency_hz && omega <= TAU*p->max_frequency_hz)
+                s->omega = omega;
+        }
         if (held) {
             s->bad_time = 0;
             if (s->state == HIP_GENTLE_START)
@@ -776,7 +804,9 @@ bool hip_gentle_update(hip_gentle_assist_t *s, double left, double right,
                     s->resume_cross_seen = true;
                 }
                 /* 首次完整左右周期内允许纠正定频，正常跟踪不反复重置掩盖失锁。 */
-                if (!resynchronizing && s->bootstrap_pending && fabs(error) > p->phase_error_limit_rad) {
+                const bool startup_mismatch = fabs(error) > p->phase_error_limit_rad;
+                /* 暂停对齐会缩小相位误差，起步仍用真实整半周期纠正频率，避免保留过快初值。 */
+                if (!resynchronizing && s->bootstrap_pending && (startup_mismatch || s->pause_used_this_half)) {
                     const double half_period = s->time_s-s->event_time;
                     const double omega = half_period > 0 ? PI/half_period : 0;
                     if (omega >= TAU*p->min_frequency_hz && omega <= TAU*p->max_frequency_hz) {
@@ -784,7 +814,8 @@ bool hip_gentle_update(hip_gentle_assist_t *s, double left, double right,
                         for (unsigned k = 0; k < HIP_GENTLE_HARMONICS; ++k)
                             s->phases[k] = wrap(s->phases[k]+(k+1)*error);
                         memset(s->rates, 0, sizeof(s->rates));
-                        s->phase = event_phase; s->enabled_time = s->time_s;
+                        s->phase = event_phase;
+                        if (startup_mismatch) s->enabled_time = s->time_s;
                         s->reason = HIP_GENTLE_STARTUP_RESEED; error = 0;
                     }
                 }
@@ -827,7 +858,7 @@ bool hip_gentle_update(hip_gentle_assist_t *s, double left, double right,
     const bool direction_waited = s->requested_direction == request &&
         s->direction_wait_s+1e-12 >= p->low_speed_release_confirm_s;
     const bool relative_pause = s->quiet_time+1e-12 >= p->reversal_confirm_s;
-    if (s->state == HIP_GENTLE_TRACK && s->startup_released && !s->bootstrap_pending && s->gate >= 1 &&
+    if (s->state == HIP_GENTLE_TRACK && s->startup_released && s->gate >= 1 &&
         !s->weak_pending && !hold_candidate && !s->pause_used_this_half && raised_pose && s->torque == 0 &&
         (relative_pause || direction_waited) && request == -s->direction &&
         request != s->completed_direction && request != s->torque_direction && !direction_ready) {
@@ -1441,6 +1472,7 @@ static void test_direction_wait_pause(const hip_gentle_parameters_t *base)
     hip_gentle_parameters_t p = *base;
     p.start_angle_rad = .2; p.reversal_speed_rad_s = .2; p.reversal_confirm_s = .03;
     p.low_speed_release_confirm_s = .05;
+    for (unsigned startup = 0; startup < 2; ++startup)
     for (int sign = -1; sign <= 1; sign += 2) {
         hip_gentle_assist_t s;
         hip_gentle_output_t o;
@@ -1449,6 +1481,7 @@ static void test_direction_wait_pause(const hip_gentle_parameters_t *base)
         s.state = HIP_GENTLE_TRACK; s.direction = sign; s.peak = .4;
         s.startup_first_leg = sign>0 ? 1 : 2; s.startup_released = true;
         s.enabled_time = -10; s.gate = 1; s.completed_direction = sign;
+        s.bootstrap_pending = startup != 0; s.bootstrap_halves_remaining = startup ? 2 : 0;
         assert(hip_gentle_update(&s, sign*.2, -sign*.2, 0, true, &o));
         bool paused = false;
         for (unsigned i = 1; i <= 12; ++i) {
@@ -1469,6 +1502,41 @@ static void test_direction_wait_pause(const hip_gentle_parameters_t *base)
             }
         }
         assert(resumed && s.state == HIP_GENTLE_TRACK);
+        assert(s.bootstrap_pending == (startup != 0) && s.bootstrap_halves_remaining == (startup ? 2 : 0));
+    }
+}
+
+static void test_paused_startup_frequency(const hip_gentle_parameters_t *base)
+{
+    hip_gentle_parameters_t p = *base;
+    p.start_angle_rad = .2;
+    for (int sign = -1; sign <= 1; sign += 2) {
+        hip_gentle_assist_t s;
+        hip_gentle_output_t o;
+        assert(hip_gentle_init(&s, &p));
+        seed(&s, .6, sign>0 ? PI : 0, TAU);
+        s.state = HIP_GENTLE_TRACK; s.direction = sign; s.peak = .6;
+        s.startup_released = true; s.enabled_time = -10;
+        assert(hip_gentle_update(&s, sign*.01, -sign*.01, 0, true, &o));
+        s.bootstrap_pending = true; s.bootstrap_halves_remaining = 1;
+        s.pause_used_this_half = true; s.event_time = -1;
+        assert(hip_gentle_update(&s, -sign*.01, sign*.01, 10, true, &o));
+        assert(s.state == HIP_GENTLE_TRACK && s.reason == HIP_GENTLE_STARTUP_RESEED);
+        assert(fabs(s.omega-PI/1.01)<1e-9 && s.enabled_time == -10);
+        assert(!s.bootstrap_pending && !s.bootstrap_halves_remaining);
+        for (unsigned startup = 0; startup < 2; ++startup) {
+            hip_gentle_reset(&s);
+            seed(&s, .6, sign>0 ? PI/2 : 3*PI/2, TAU);
+            s.pause_from_state = HIP_GENTLE_TRACK; s.direction = sign; s.peak = .6;
+            s.phase_paused = true; s.pause_zeroed = true; s.time_s = .75;
+            s.bootstrap_pending = startup != 0; s.bootstrap_halves_remaining = startup ? 2 : 0;
+            const double x = sign*.5;
+            const double phase = wrap(sign<0 ? asin(x/.6) : PI-asin(x/.6));
+            const double expected = startup ? wrap(phase-(sign>0 ? 0 : PI))/.75 : TAU;
+            resume_phase_pause(&s, x);
+            assert(fabs(s.omega-expected)<1e-9 && s.torque == 0 && !s.phase_paused);
+            assert(s.bootstrap_halves_remaining == (startup ? 2 : 0));
+        }
     }
 }
 
@@ -1496,6 +1564,56 @@ static void test_startup_full_cycle_window(const hip_gentle_parameters_t *base)
     s.peak = .6; s.phases[0] = PI; memset(s.rates, 0, sizeof(s.rates));
     assert(hip_gentle_update(&s, .01, -.01, 1040, true, &o));
     assert(s.state == HIP_GENTLE_EXIT && s.reason == HIP_GENTLE_EVENT_MISMATCH);
+}
+
+static void test_same_direction_release_resume(const hip_gentle_parameters_t *base)
+{
+    hip_gentle_parameters_t p = *base;
+    p.motion_rise_s = .16; p.motion_fall_s = .08; p.slew_nm_s = 50;
+    for (int sign = -1; sign <= 1; sign += 2) {
+        for (unsigned blocked = 0; blocked < 4; ++blocked) {
+            hip_gentle_assist_t s;
+            assert(hip_gentle_init(&s, &p));
+            s.state = HIP_GENTLE_TRACK; s.startup_released = true;
+            s.torque = sign*2; s.motion_waiting = true; s.motion_ramp_pending = true;
+            s.quiet_time = p.low_speed_release_confirm_s;
+            s.weak_pending = blocked == 1; s.phase_paused = blocked == 2;
+            if (blocked == 3) s.hold_quiet_time = p.hold_confirm_s*.5;
+            release_motion_torque(&s, .01);
+            assert(s.motion_release_resumable == (blocked == 0));
+            assert(s.motion_release_duration <= .24+1e-12);
+            if (!blocked) {
+                /* 复动晚于旧160ms期限时，也应保留同向接续机会。 */
+                for (unsigned i = 0; i < 17; ++i) release_motion_torque(&s, .01);
+                assert(s.torque*sign > 0 && s.motion_releasing);
+                const double previous = s.torque;
+                s.previous_x = sign*.06; s.quiet_time = 0;
+                s.motion_direction = sign; s.motion_confirm_time = p.reversal_confirm_s;
+                apply_motion_target(&s, sign*4, .01);
+                assert(!s.motion_releasing && !s.motion_waiting && s.torque == previous);
+                assert(s.motion_entry_torque == previous);
+                for (unsigned i = 0; i < 20; ++i) {
+                    const double q = s.torque;
+                    apply_motion_target(&s, sign*4, .01);
+                    assert(s.torque*sign > 0 && fabs(s.torque-q)<=.5+1e-12);
+                }
+            } else {
+                for (unsigned i = 0; i < 30; ++i) release_motion_torque(&s, .01);
+                assert(s.torque == 0);
+            }
+        }
+        hip_gentle_assist_t s;
+        assert(hip_gentle_init(&s, &p));
+        s.state = HIP_GENTLE_TRACK; s.startup_released = true;
+        s.torque = sign*2; s.motion_waiting = true; s.motion_ramp_pending = true;
+        s.quiet_time = p.low_speed_release_confirm_s;
+        for (unsigned i = 0; i < 25; ++i) {
+            const double q = s.torque;
+            apply_motion_target(&s, -sign*4, .01);
+            assert(s.torque*sign >= 0 && fabs(s.torque)<=fabs(q));
+        }
+        assert(s.torque == 0);
+    }
 }
 
 static void test_motion_smoothing(const hip_gentle_parameters_t *base)
@@ -1919,10 +2037,12 @@ int main(void)
     test_double_peak(&p);
     test_pacing_recovery(&p);
     test_motion_smoothing(&p);
+    test_same_direction_release_resume(&p);
     test_torque_handoff(&p);
     test_phase_paused(&p);
     test_direction_wait_pause(&p);
     test_startup_full_cycle_window(&p);
+    test_paused_startup_frequency(&p);
     test_long_hold_resume(&p);
     test_hold_micro_motion(&p);
     test_slow_progress(&p);
