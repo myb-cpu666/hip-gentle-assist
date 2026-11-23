@@ -1,317 +1,278 @@
-/*
- * 髋关节舒缓助力模式使用说明
- * 输入左右髋角度，内部跟踪角度差的相位，以公共波形生成双髋力矩（N·m）。
- * 公共波形经限幅、限速后左右反向输出；默认伸展与屈曲等幅。
- * 首腿动作仅用于学习相位，确认另一腿开始抬起后才从零渐入助力。
- * 首次峰值回落到过零时，若观测频率比初值快20%以上且在允许范围内，提前纠正偏慢初值；
- * 较慢回落不据此降低初值，首次助力无需等整个半周期结束才得到纠偏。
- * 起步在进入TRACK后的两个有效完整半周期内，频率偏差超过20%时直接纠频；
- * 相位未失配时沿原限速对齐，不因普通纠频重启渐入；窗口结束恢复正常跟踪。
- *
- * 力矩设置：大摆幅上限由 ASSIST_GENTLE_ADAPTIVE_MAX_NM 设置，默认8 N·m；
- * 小摆幅取上限的 ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT，默认50%（4 N·m）。
- * 判档使用角度差的AFO第一谐波幅值，不是瞬时角度差或速度；0.60 rad升档、0.50 rad降档，
- * 中间保持原档位，幅值平滑过渡。幅值是波形上限，并非每一步都必须达到的实际力矩。
- *
- * 暂停与恢复：TRACK中启动渐入完成、非弱峰候选且仍处于抬腿姿态时（含起步定频校准期），
- * 零力矩下若下一回落方向未确认，相对低速达30ms或该方向等待达50ms，进入短暂停。
- * 暂停时冻结预测相位，实际回落确认或真实过零后，在零力矩帧对齐相位，再平滑接入。
- * 短暂停保留两腿确认和幅值档位；不增加踱步、下楼等场景识别。
- * 起步校准中的短停恢复会按当前半波进度估频，下一真实过零再用完整半周期校正；
- * 正常恢复不重启全局渐入，校准结束后仍执行原相位失配保护。
- * 已确认的长HOLD可零力矩不限时等待；落腿恢复后有限重校准。中立站稳等停止条件仍有效。
- * 普通低速衔接使用原默认240ms归零预算：增长中的力矩可有限保持，再按剩余预算卸力。
- * 实际同向速度确认后，位移不足时仅保持余力；达到0.05rad净位移后才平滑增加助力。
- * 未确认复动不延长归零期限；目标换向、明确反向运动、弱峰及悬停会提前结束保持。
- * 普通卸力中若余力不超过0.05N·m，且目标与实际运动均已确认换向，则按限速及时归零，
- * 不再等待完整卸力窗口；确认结束的旧方向不能因目标反弹而重新接回。
- * 普通停顿平滑卸力；正式EXIT沿限速归零，故障/无效输入复位清零。
- * 2秒无进展超时不是半步完成期限，也不是已确认长HOLD的等待上限。
- *
- * 本项目通过 assist_algorithm.c 接入，不要另建一套状态重复驱动电机。
- * 参数宏在初始化时复制到状态中；修改后需重新编译、烧录，运行中不直接改内部状态。
- * 电机使能、故障及反馈时效由上层检查，本模块仅接收角度、时间戳和有效性标志。
- *
- * 调用示例（放在使用本模块的 .c 文件中）：
- *
- * #include "hip_gentle_assist.h"
- * #include "esp_timer.h"
- *
- * static hip_gentle_assist_t phase_state;
- * static const hip_gentle_parameters_t phase_parameters = {
- *     .amplitude_nm = ASSIST_GENTLE_AMPLITUDE_NM,
- *     .torque_limit_nm = ASSIST_GENTLE_TORQUE_LIMIT_NM,
- *     .extension_torque_ratio = ASSIST_GENTLE_EXTENSION_TORQUE_RATIO,
- *     .adaptive_enabled = ASSIST_GENTLE_ADAPTIVE_ENABLED,
- *     .adaptive_max_nm = ASSIST_GENTLE_ADAPTIVE_MAX_NM,
- *     .swing_up_threshold_rad = ASSIST_GENTLE_SWING_UP_THRESHOLD_RAD,
- *     .swing_down_threshold_rad = ASSIST_GENTLE_SWING_DOWN_THRESHOLD_RAD,
- *     .amplitude_increase_nm_s = ASSIST_GENTLE_AMPLITUDE_INCREASE_NM_S,
- *     .amplitude_decrease_nm_s = ASSIST_GENTLE_AMPLITUDE_DECREASE_NM_S,
- *     .start_angle_rad = ASSIST_GENTLE_START_ANGLE_RAD,
- *     .startup_lift_angle_rad = ASSIST_GENTLE_STARTUP_LIFT_ANGLE_RAD,
- *     .startup_lift_speed_rad_s = ASSIST_GENTLE_STARTUP_LIFT_SPEED_RAD_S,
- *     .startup_lift_confirm_s = ASSIST_GENTLE_STARTUP_LIFT_CONFIRM_S,
- *     .derivative_window_s = ASSIST_GENTLE_DERIVATIVE_WINDOW_S,
- *     .min_frequency_hz = ASSIST_GENTLE_MIN_FREQUENCY_HZ,
- *     .max_frequency_hz = ASSIST_GENTLE_MAX_FREQUENCY_HZ,
- *     .quiet_speed_rad_s = ASSIST_GENTLE_QUIET_SPEED_RAD_S,
- *     .quiet_duration_s = ASSIST_GENTLE_QUIET_DURATION_S,
- *     .hold_confirm_s = ASSIST_GENTLE_HOLD_CONFIRM_S,
- *     .hold_range_rad = ASSIST_GENTLE_HOLD_RANGE_RAD,
- *     .low_speed_release_confirm_s = ASSIST_GENTLE_LOW_SPEED_RELEASE_CONFIRM_S,
- *     .reversal_speed_rad_s = ASSIST_GENTLE_REVERSAL_SPEED_RAD_S,
- *     .reversal_confirm_s = ASSIST_GENTLE_REVERSAL_CONFIRM_S,
- *     .peak_drop_ratio = ASSIST_GENTLE_PEAK_DROP_RATIO,
- *     .weak_half_cycles = ASSIST_GENTLE_WEAK_HALF_CYCLES,
- *     .weak_peak_stop_enabled = ASSIST_GENTLE_WEAK_PEAK_STOP_ENABLED,
- *     .progress_timeout_s = ASSIST_GENTLE_PROGRESS_TIMEOUT_S,
- *     .tracking_error_stop_enabled = ASSIST_GENTLE_TRACKING_ERROR_STOP_ENABLED,
- *     .tracking_error_rad = ASSIST_GENTLE_TRACKING_ERROR_RAD,
- *     .tracking_error_duration_s = ASSIST_GENTLE_TRACKING_ERROR_DURATION_S,
- *     .phase_error_limit_rad = ASSIST_GENTLE_EVENT_ERROR_LIMIT_RAD,
- *     .phase_correction_rad_s = ASSIST_GENTLE_CORRECTION_RAD_S,
- *     .slew_nm_s = ASSIST_GENTLE_SLEW_NM_S,
- *     .motion_rise_s = ASSIST_GENTLE_MOTION_RISE_S,
- *     .motion_fall_s = ASSIST_GENTLE_MOTION_FALL_S,
- *     .reset_gap_s = ASSIST_GENTLE_RESET_GAP_S,
- *     .width = ASSIST_GENTLE_WIDTH, .asymmetry = ASSIST_GENTLE_ASYMMETRY,
- *     .response = ASSIST_GENTLE_RESPONSE,
- *     .inner_rise_s = ASSIST_GENTLE_INNER_RISE_S,
- *     .outer_rise_s = ASSIST_GENTLE_OUTER_RISE_S,
- *     .amplitude_gain = ASSIST_GENTLE_AMPLITUDE_GAIN,
- *     .phase_gain = ASSIST_GENTLE_PHASE_GAIN,
- *     .frequency_gain = ASSIST_GENTLE_FREQUENCY_GAIN,
- *     .bias_gain = ASSIST_GENTLE_BIAS_GAIN,
- * };
- *
- * // 上电初始化一次，返回 false 时不进入助力控制。
- * bool hip_control_init(void)
- * {
- *     return hip_gentle_init(&phase_state, &phase_parameters);
- * }
- *
- * // 助力开启后每 10ms 调用，包括暂停期间；valid 应包含上层对反馈和电机状态的检查。
- * bool hip_control_step(double left_rad, double right_rad, bool valid,
- *                       hip_gentle_output_t *output)
- * {
- *     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
- *     return hip_gentle_update(&phase_state, left_rad, right_rad,
- *                             now_ms, valid, output);
- * }
- *
- * // 上层检查 step 返回值后读取 output.left_torque_nm / right_torque_nm；
- * // 返回 false 时停止助力，不继续发送上一帧力矩。电机发送和使能由上层负责。
- * // 停止助力时调用 hip_gentle_reset(&phase_state)，并由上层处理电机停机；
- * // reset 仅清空算法状态，不负责发送零力矩或执行平滑卸力。
- */
 #ifndef HIP_GENTLE_ASSIST_H
 #define HIP_GENTLE_ASSIST_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ============================================================================
- * 舒缓模式专用参数：浮点常量及内部数学状态使用 double。
- * 假设编码器左右均以屈曲为正，输入左角度减右角度；公共波形限速后左右反号输出。
- * 持续低速确认后目标归零，短时保留跟踪；确认实际运动方向且指令回零后才允许换向。
- * ============================================================================ */
-#define ASSIST_GENTLE_ADAPTIVE_MAX_NM 8.0     // 大摆幅目标幅值/绝对限幅，N·m
-#define ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT 50 // 小摆幅占上限的整数百分比，0～100；0关闭舒缓输出
-#if ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT < 0 || ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT > 100
-#error "Gentle low amplitude percentage must be an integer from 0 to 100"
-#endif
-#define ASSIST_GENTLE_AMPLITUDE_NM (ASSIST_GENTLE_ADAPTIVE_MAX_NM * ASSIST_GENTLE_LOW_AMPLITUDE_PERCENT / 100.0) // 派生值，不单独设置
-#define ASSIST_GENTLE_TORQUE_LIMIT_NM ASSIST_GENTLE_ADAPTIVE_MAX_NM // 绝对输出限幅，与自适应最大值共用
-#define ASSIST_GENTLE_EXTENSION_TORQUE_RATIO 1.0 // 伸展相对屈曲的幅值比例，0～1；0关闭伸展，1等幅
-#define ASSIST_GENTLE_START_ANGLE_RAD 0.20    // 左右角度差向外越过±0.20rad开始学习，约11.5°
-#define ASSIST_GENTLE_STARTUP_LIFT_ANGLE_RAD 0.05 // 单腿连续屈曲段最小抬升量，rad，约2.9°
-#define ASSIST_GENTLE_STARTUP_LIFT_SPEED_RAD_S 0.12 // 单腿屈曲确认速度，rad/s
-#define ASSIST_GENTLE_STARTUP_LIFT_CONFIRM_S 0.05 // 连续屈曲确认时间，s；确认第二条腿后才渐入出力
-#define ASSIST_GENTLE_FEEDBACK_MAX_AGE_MS 100U // 编码器反馈有效期，ms
-#define ASSIST_GENTLE_DERIVATIVE_WINDOW_S 0.04 // 约四个 10ms 间隔；固定缓冲支持不超过 61ms
-#define ASSIST_GENTLE_MIN_FREQUENCY_HZ 0.15  // 完整步态周期频率下限，Hz；对应半周期约3.33s，仍受进展及失配检查约束
-#define ASSIST_GENTLE_MAX_FREQUENCY_HZ 3.50  // 跟踪频率上限，Hz
-
-/* ============================================================================
- * 启停与失锁保护：静止确认、弱半波、无进展退出及跟踪误差检测。
- * ============================================================================ */
-#define ASSIST_GENTLE_QUIET_SPEED_RAD_S 0.10 // 角度差速度低速阈值，rad/s，连续确认后卸力；也用于首峰回落确认
-#define ASSIST_GENTLE_LOW_SPEED_RELEASE_CONFIRM_S 0.05 // 连续低速撤力确认，s；也用作零力矩下下一回落方向等待的短暂停门槛
-#define ASSIST_GENTLE_QUIET_DURATION_S 2.0  // 非悬停低速且无进展的退出时间，也用于站稳解除防震荡门槛，s
-#define ASSIST_GENTLE_HOLD_CONFIRM_S 1.0    // 抬腿姿态在允许范围内持续稳定的确认时间，s
-#define ASSIST_GENTLE_HOLD_RANGE_RAD 0.08   // 候选窗口内每腿及角度差的最大变化范围，rad，允许姿态微调
-#define ASSIST_GENTLE_REVERSAL_SPEED_RAD_S 0.20 // 允许重新出力/换向的角度差速度幅值，rad/s，应高于低速阈值
-#define ASSIST_GENTLE_REVERSAL_CONFIRM_S 0.03 // 同方向连续确认时间，s；也用作零力矩下相对低速触发短暂停的门槛
-#define ASSIST_GENTLE_PEAK_DROP_RATIO 0.50  // 弱峰相对门槛=最近2个同方向有效半波最大峰值×此比例；调低会减弱停止抑振
-#define ASSIST_GENTLE_WEAK_HALF_CYCLES 2U   // 连续弱半波退出数量
-#define ASSIST_GENTLE_WEAK_PEAK_STOP_ENABLED 1 // 弱峰回摆先卸力保留步态，过零仍弱才退出；0关闭此项
-#if ASSIST_GENTLE_WEAK_PEAK_STOP_ENABLED != 0 && ASSIST_GENTLE_WEAK_PEAK_STOP_ENABLED != 1
-#error "Weak peak stop switch must be 0 or 1"
-#endif
-#define ASSIST_GENTLE_PROGRESS_TIMEOUT_S 2.0 // 连续无有效角度进展的退出时间，s；不是半步完成期限
-#define ASSIST_GENTLE_TRACKING_ERROR_STOP_ENABLED 0 // 0 关闭重建误差超时退出，1 开启
-#if ASSIST_GENTLE_TRACKING_ERROR_STOP_ENABLED != 0 && ASSIST_GENTLE_TRACKING_ERROR_STOP_ENABLED != 1
-#error "Phase tracking error stop switch must be 0 or 1"
-#endif
-#define ASSIST_GENTLE_TRACKING_ERROR_RAD 0.50 // 重建绝对误差阈值，rad
-#define ASSIST_GENTLE_TRACKING_ERROR_DURATION_S 0.30 // 误差连续超限时间，s
-#define ASSIST_GENTLE_EVENT_ERROR_LIMIT_RAD 1.5707963267948966 // 事件相位失配阈值，rad
-#define ASSIST_GENTLE_CORRECTION_RAD_S 1.0   // 持续跟踪的小相位偏差限速修正
-#define ASSIST_GENTLE_SLEW_NM_S 50.0         // 实际 dt 限速，10ms 最多变化 0.5 N·m
-#define ASSIST_GENTLE_MOTION_RISE_S 0.16     // 首次/停顿/大目标或方向等待后接入的局部渐入，s；已确认方向的近零换向直接跟随
-#define ASSIST_GENTLE_MOTION_FALL_S 0.08     // 普通停顿的平滑卸力时间下限，s；连续相位回零和正式退出沿用限速
-#define ASSIST_GENTLE_RESET_GAP_S 0.02       // 实际控制周期超过 20ms 即复位清零
-
-/* ============================================================================
- * 波形、渐入和自适应振荡器：两级渐入并行相乘。
- * ============================================================================ */
-#define ASSIST_GENTLE_WIDTH 1.04
-#define ASSIST_GENTLE_ASYMMETRY (-0.02)
-#define ASSIST_GENTLE_RESPONSE 65.0          // 相位偏移 response/100-0.92 rad
-#define ASSIST_GENTLE_INNER_RISE_S 0.6       // 内层渐入时间，s；按实际 dt/0.6 推进
-#define ASSIST_GENTLE_OUTER_RISE_S 0.45      // 外层渐入时间，s；两层并行相乘，加快首步接入
-#define ASSIST_GENTLE_AMPLITUDE_GAIN 2.5
-#define ASSIST_GENTLE_PHASE_GAIN 1.6
-#define ASSIST_GENTLE_FREQUENCY_GAIN 3.2
-#define ASSIST_GENTLE_BIAS_GAIN 0.5
-
-/* ============================================================================
- * 角摆幅两档调幅：与网页角摆幅同源，取fabs(AFO第一谐波幅值)，单位rad。
- * 小摆幅=上限×百分比，默认4/8 N·m；升降档门槛不同，区间内保持原档位。
- * 首次过渡、悬停恢复再校准、弱峰候选及起步渐入期间回到低档。
- * ============================================================================ */
-#define ASSIST_GENTLE_ADAPTIVE_ENABLED 1      // 0 固定基准幅值，1 稳定跟踪后按角摆幅分档
-#define ASSIST_GENTLE_SWING_UP_THRESHOLD_RAD 0.60   // 低档达到此角摆幅时升档，rad
-#define ASSIST_GENTLE_SWING_DOWN_THRESHOLD_RAD 0.50 // 高档降到此角摆幅时降档，rad；须小于升档门槛
-#define ASSIST_GENTLE_AMPLITUDE_INCREASE_NM_S 3.0 // 幅值包络增加速度，N·m/s
-#define ASSIST_GENTLE_AMPLITUDE_DECREASE_NM_S 6.0 // 幅值包络降低速度；停止不等待此包络
-#if ASSIST_GENTLE_ADAPTIVE_ENABLED != 0 && ASSIST_GENTLE_ADAPTIVE_ENABLED != 1
-#error "Adaptive amplitude switch must be 0 or 1"
+#ifdef __cplusplus
+extern "C" {
 #endif
 
-/* 舒缓模式独立副本，源自 hip_phase_assist.c/.h；后续舒缓助力在本模块调整，不含电机通信。
- * 固定缓冲、无堆分配；实际运行耗时须实机测量。 */
-#define HIP_GENTLE_HISTORY_CAPACITY 64U
-#define HIP_GENTLE_HARMONICS 5U
-#define HIP_GENTLE_PEAK_HISTORY_CAPACITY 2U // 每个方向各自保存，总计4个半波
-#define HIP_GENTLE_REVERSAL_RESIDUAL_NM 0.05 // 确认换向后可快速归零的微小余力上限，N·m
-#define HIP_GENTLE_STARTUP_FREQUENCY_TOLERANCE 0.20 // 起步整半周期频率偏差超过20%才主动纠偏
-#define HIP_GENTLE_STARTUP_SYNC_HALVES 2U // 首次校准观察完整左右周期，避免只验证较快一侧
-#define HIP_GENTLE_RESUME_SYNC_HALVES 4U // 悬停恢复后用两个完整周期重新确认频率
+/* 100 Hz 髋舒缓模式。两腿均以屈曲为正，输入 rad、rad/s，输出解剖系 N·m。
+ * 调用 hip_gentle_init(&state, NULL) 初始化一次。之后在控制任务中每 10 ms 调用 hip_gentle_step，
+ * 同时传入双髋反馈、本地单调毫秒时间戳和本帧每侧最大力矩（N·m）。
+ * FIRST_STEP 观察首峰。LOCK_IN 和 STEADY 生成波形；正常退出按当前力矩线性卸力，硬失能立即清零。
+ * 升档幅值默认连续渐增，zero_cross_latch 可选角差过零锁存；降档立即按新上限约束双髋。
+ */
+/* ==================== 一、采样与零偏校准 ==================== */
+#define ASSIST_GENTLE_FEEDBACK_MAX_AGE_MS  100U  /* 编码器反馈最大允许过期时间 (ms) */
+#define HIP_GENTLE_RESET_GAP_MS            50U   /* 两帧间隔超过此阈值触发时间戳复位 (ms) */
+#define HIP_GENTLE_DY_WINDOW               4U    /* 角差导数滑窗点数（100 Hz 下约 40 ms） */
+#define HIP_GENTLE_STATIC_VEL_FILTER_S     0.010f /* 两侧角速度一阶低通时间常数 (s) */
+#define HIP_GENTLE_IDLE_OFFSET_LIMIT_RAD   0.15f /* 站立静止零偏自适应校准最大允许偏置 (rad) */
+#define HIP_GENTLE_IDLE_OFFSET_TAU_S       0.50f /* 站立静止零偏慢跟踪时间常数 (s) */
+
+/* ==================== 二、默认助力与波形参数 ==================== */
+#define HIP_GENTLE_DEFAULT_RESPONSE          0.0f   /* 默认响应超前/滞后调节值 [0, 100]（越大越超前，越小越偏向屈曲托举、伸展柔和） */
+#define HIP_GENTLE_DEFAULT_WIDTH             1.04f   /* 升余弦波形占空/脉宽参数 [0.1, 2.0] */
+#define HIP_GENTLE_DEFAULT_ASYMMETRY         (-0.02f)/* 升余弦波形非对称偏置 (-1, 1) */
+#define HIP_GENTLE_DEFAULT_PHASE_OFFSET_RAD  0.0f    /* AFO 输出相位附加偏置 (rad) */
+#define HIP_GENTLE_DEFAULT_ZERO_CROSS_LATCH  false   /* true=角差过零时锁存升档幅值，降档总是立即限幅 */
+#define HIP_GENTLE_DEFAULT_SUPERVISION_SCALE true    /* 默认开启小幅与超时监督缩放 */
+#define HIP_GENTLE_DEFAULT_SYNC_PEAK_AMP     false   /* 是否在 STEADY 波峰处硬同步 AFO 直流/幅值 */
+#define HIP_GENTLE_DEFAULT_LOW_CADENCE_EXIT  false   /* 默认关闭低步频连续退出保护（避免叉腿停顿后落腿续步被误断） */
+#define HIP_GENTLE_DEFAULT_EXTENDED_TIMING   false   /* 默认关闭扩展半步超时倍率 */
+#define HIP_GENTLE_DEFAULT_GEO_PHASE_PULL    false   /* 默认关闭减速段几何相位柔性牵引 */
+#define HIP_GENTLE_DEFAULT_REVERSAL_ENV      false   /* 默认关闭角差退缩包络乘法调制（仅观测） */
+
+/* ==================== 三、软启动、斜坡与卸力限速 ==================== */
+#define HIP_GENTLE_GEAR_RISE_NM_S         (20.0f / 3.0f) /* 升档时波形幅值增加速率 (N·m/s) */
+#define HIP_GENTLE_RESP_RAMP_INIT          HIP_GENTLE_DEFAULT_RESPONSE /* 复位时响应参数斜坡初始值（与默认响应对齐，避免起步相位漂移） */
+#define HIP_GENTLE_RESP_RAMP_RATE_S        20.0f /* 响应参数变化追踪斜坡速率 (1/s) */
+#define HIP_GENTLE_INNER_RAMP_S            2.0f  /* 级联内层软启动总时长 (s) */
+#define HIP_GENTLE_OUTER_RAMP_S            1.5f  /* 级联外层软启动总时长 (s) */
+#define HIP_GENTLE_EXIT_RAMP_S             0.08f /* 正常停步/退步线性卸力参考时间 (s) */
+#define HIP_GENTLE_TORQUE_SLEW_NM_S        60.0f /* 最终输出力矩变化率硬限幅 (N·m/s) */
+
+/* ==================== 四、步幅-力矩上限映射（S 曲线） ==================== */
+#define HIP_GENTLE_AMP_SCALE_MIN_DEG       6.0f  /* 步幅上限缩放起始角差幅值 (deg，<=此值为 0) */
+#define HIP_GENTLE_AMP_SCALE_FULL_DEG      45.0f /* 步幅上限缩放置满角差幅值 (deg，>=此值为 1) */
+#define HIP_GENTLE_AMP_CONF_RISE_TAU_S     0.15f /* 步幅增大时上限置信度慢升滤波时间常数 (s) */
+#define HIP_GENTLE_AMP_CONF_FALL_TAU_S     0.06f /* 步幅减小时上限置信度快降滤波时间常数 (s) */
+#define HIP_GENTLE_AMP_ZERO_CROSS_LATCH    true  /* true=仅在波形过零点锁存步幅上限（单半步保形），false=逐帧实时缩放 */
+
+
+/* ==================== 五、五谐波 AFO 振荡器参数 ==================== */
+#define HIP_GENTLE_AFO_SUBSTEPS            5U     /* 单帧控制周期内部积分细分步数 */
+#define HIP_GENTLE_AFO_GAIN_ETA_ALPHA      2.5f   /* AFO 基波幅值自适应学习基准增益 */
+#define HIP_GENTLE_AFO_GAIN_NU_PHI         6.0f   /* AFO 相位自适应学习基准增益（弧度制） */
+#define HIP_GENTLE_AFO_GAIN_GAMMA_OMEGA    5.0f   /* AFO 基频自适应学习基准增益（弧度制） */
+#define HIP_GENTLE_AFO_GAIN_ETA_0          0.5f   /* AFO 直流偏置自适应学习基准增益 */
+#define HIP_GENTLE_AFO_MIN_OMEGA_RAD_S     2.0f   /* AFO 角频率安全下限 (rad/s，约 38 步/分) */
+#define HIP_GENTLE_AFO_MAX_OMEGA_RAD_S     12.5f  /* AFO 角频率安全上限 (rad/s) */
+#define HIP_GENTLE_AFO_FILTER_TAU_S        0.126f /* 步频与特征速度低通滤波时间常数 (s) */
+#define HIP_GENTLE_AFO_ANCHOR_MIN_RATIO    0.75f  /* 过零重锚允许单步降频最小倍率 */
+#define HIP_GENTLE_AFO_ANCHOR_MAX_RATIO    1.30f  /* 过零重锚允许单步升频最大倍率 */
+#define HIP_GENTLE_GEO_PHASE_PULL_ALPHA    0.02f  /* 减速段可选几何相位柔性牵引权重 */
+
+/* ==================== 六、八特征点与五状态机时序门限 ==================== */
+#define HIP_GENTLE_START_THRESHOLD_DEG     2.5f   /* 离开中立位的角差起步阈值 (deg) */
+#define HIP_GENTLE_COOLDOWN_THRESHOLD_DEG  0.5f   /* 普通退出 COOLDOWN 回落回 IDLE 角差阈值 (deg) */
+#define HIP_GENTLE_PEAK_MARGIN_DEG         0.5f   /* 慢步转峰判据超阈裕度 (deg) */
+#define HIP_GENTLE_RAPID_REVERSAL_DEG_S    500.0f /* 急换向保护通道触发单侧屈曲角速度门限 (deg/s) */
+#define HIP_GENTLE_STATIC_SPEED_RAD_S      0.70f  /* 步态静止检测速度死区 (rad/s，约 40.1 deg/s) */
+#define HIP_GENTLE_SETTLED_SPEED_RAD_S     0.25f  /* 站立零偏校准与冷却停稳确认速度死区 (rad/s) */
+#define HIP_GENTLE_FIRST_STEP_STATIC_S     1.0f   /* FIRST_STEP 双侧静止超时退出时长 (s) */
+#define HIP_GENTLE_FIRST_STEP_TIMEOUT_S    3.0f   /* FIRST_STEP 未达峰谷总超时退出时长 (s) */
+#define HIP_GENTLE_ACTIVE_STATIC_S         1.5f   /* LOCK_IN/STEADY 叉腿宽站姿双侧静止停步时长 (s) */
+#define HIP_GENTLE_COOLDOWN_STATIC_S       0.5f   /* COOLDOWN 共振退出后双侧停稳恢复时长 (s) */
+#define HIP_GENTLE_DYN_TO_SPEED_DEG_S      100.0f /* 动态超时系数高速/低速切换活动速度门限 (deg/s) */
+#define HIP_GENTLE_DYN_TO_FAST_COEFF       3.0f   /* 正常活动或峰/谷保持时的动态超时倍率 */
+#define HIP_GENTLE_DYN_TO_SLOW_COEFF       0.3f   /* 低速停滞收缩时的动态超时收紧倍率 */
+#define HIP_GENTLE_DYN_TO_TAU_S            0.10f  /* 动态超时系数 k_to 一阶低通时间常数 (s) */
+#define HIP_GENTLE_MIN_INTERVAL_LIMIT_S    0.40f  /* 外摆区间 (evt=1/5) 超时监督最小保底时限 (s) */
+#define HIP_GENTLE_MIN_NEUTRAL_LIMIT_S     0.12f  /* 并腿过零区 (evt=0/4) 超时监督最小保底时限 (s) */
+#define HIP_GENTLE_MIN_RETURN_LIMIT_S      0.15f  /* 峰后回程区 (evt=3/7) 超时监督最小保底时限 (s) */
+#define HIP_GENTLE_STILL_SPEED_RAD_S       0.35f  /* 真静止检测速度死区 (rad/s，约 20.1 deg/s) */
+#define HIP_GENTLE_NARROW_STOP_DEG         15.0f  /* 并腿窄站姿快退判定角差上限 (deg) */
+#define HIP_GENTLE_NARROW_STOP_STATIC_S    0.22f  /* 并腿窄站姿双侧真静止快退确认时长 (s) */
+#define HIP_GENTLE_PEAK_FADE_S             0.20f  /* 峰/谷超时后预淡出持续窗口 (s) */
+#define HIP_GENTLE_MIN_PEAK_FADE_S         1.30f  /* STEADY 峰/谷保持预淡出前最小保底时长 (s，加 0.20 s 淡出约 1.50 s) */
+#define HIP_GENTLE_MIN_HALF_PERIOD_S       0.25f  /* 状态机步态半周期下限钳位 (s) */
+#define HIP_GENTLE_MAX_HALF_PERIOD_S       3.0f   /* 状态机步态半周期上限钳位 (s) */
+#define HIP_GENTLE_TIMEOUT_RECOVER_TAU_S   0.10f  /* 未超时阶段 scale_timeout 回升时间常数 (s) */
+#define HIP_GENTLE_ENV_FAST_TAU_S          0.074f /* 角差快速退缩时 scale_env 衰减时间常数 (s) */
+#define HIP_GENTLE_ENV_RECOVER_TAU_S       0.25f  /* lockin_gain 与 scale_env 恢复时间常数 (s) */
+
+/* ==================== 七、异常步频与停步共振防护 ==================== */
+#define HIP_GENTLE_LOW_CADENCE_OMEGA_RAD_S    2.2f  /* 稳态低步频退出判定滤波角频率上限 (rad/s) */
+#define HIP_GENTLE_LOW_CADENCE_CONFIRM_S      0.25f /* 稳态低步频连续确认退出时长 (s) */
+#define HIP_GENTLE_RESONANCE_OMEGA_RAD_S      11.5f /* 异常高频共振冷却滤波角频率门槛 (rad/s) */
+#define HIP_GENTLE_RESONANCE_CONFIRM_S        0.18f /* 异常高频连续确认进入共振冷却时长 (s) */
+#define HIP_GENTLE_SHORT_HALF_S               0.30f /* 短半步绝对时长门槛 (s) */
+#define HIP_GENTLE_SHRINK_PEAK_MAX_DEG        26.0f /* 两半步缩幅缩时保护触发峰值上限 (deg) */
+#define HIP_GENTLE_SHRINK_PEAK_RATIO          0.80f /* 两半步缩幅判定相对同侧参考峰值比例 */
+#define HIP_GENTLE_CONTRACT_HALF_RATIO        0.75f /* 两半步缩时判定相对参考半周期比例 */
+#define HIP_GENTLE_SHRINK_CONFIRM_HALVES      2U    /* 连续缩幅缩时触发共振冷却的半步数门槛 */
+#define HIP_GENTLE_ABRUPT_SHRINK_PEAK_DEG     20.0f /* 单半步突发坍缩直切共振的峰值上限 (deg) */
+#define HIP_GENTLE_ABRUPT_SHRINK_PEAK_RATIO   0.62f /* 单半步突发坍缩相对同侧参考峰值比例 */
+#define HIP_GENTLE_ABRUPT_SHRINK_HALF_RATIO   0.65f /* 单半步突发坍缩相对参考半周期比例 */
+#define HIP_GENTLE_REF_ADAPT_ALPHA            0.15f /* 正常步幅与半周期参考值的指数更新系数 */
+#define HIP_GENTLE_EARLY_STOP_ENABLE          true  /* true=开启早峰回落停步快退（识别半步刹车后收腿） */
+#define HIP_GENTLE_EARLY_STOP_MIN_REF_DEG     28.0f /* 启用早峰停步判定的同侧参考步幅下限 (deg) */
+#define HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG    30.0f /* 触发早峰挂起的本次峰值角差上限 (deg) */
+#define HIP_GENTLE_EARLY_STOP_PEAK_RATIO      0.65f /* 触发早峰挂起相对同侧参考峰值的比例上限 */
+#define HIP_GENTLE_EARLY_STOP_PHASE_LEAD_DEG  18.0f /* 触峰相对 90/270 deg 的最小提前相位角 (deg) */
+#define HIP_GENTLE_EARLY_STOP_FALL_DEG        6.0f  /* 早峰挂起后确认收腿退出所需的角差回落量 (deg) */
+#define HIP_GENTLE_EARLY_STOP_COOLDOWN_S      0.50f /* 早峰停步退出后的最短冷却防反抽时长 (s) */
 
 typedef enum {
-    HIP_GENTLE_WAIT, HIP_GENTLE_COLLECT, HIP_GENTLE_START, HIP_GENTLE_TRACK, HIP_GENTLE_EXIT,
-    HIP_GENTLE_HOLD
+    HIP_GENTLE_IDLE, HIP_GENTLE_FIRST_STEP, HIP_GENTLE_LOCK_IN, HIP_GENTLE_STEADY,
+    HIP_GENTLE_COOLDOWN
 } hip_gentle_state_id_t;
 
 typedef enum {
-    HIP_GENTLE_WAITING_CROSSING, HIP_GENTLE_INVALID_ANGLE, HIP_GENTLE_TIMESTAMP_RESET,
-    HIP_GENTLE_WAITING_NEW_CROSSING, HIP_GENTLE_QUIET, HIP_GENTLE_NO_PROGRESS,
-    HIP_GENTLE_INCOMPLETE_HALF_WAVE, HIP_GENTLE_INVALID_FIRST_PEAK,
-    HIP_GENTLE_SEED_FREQUENCY_RANGE, HIP_GENTLE_EVENT_SEED, HIP_GENTLE_INVALID_TRACKER,
-    HIP_GENTLE_AMPLITUDE_DROP, HIP_GENTLE_STARTUP_RESEED, HIP_GENTLE_EVENT_MISMATCH,
-    HIP_GENTLE_TRACKING_ERROR, HIP_GENTLE_HISTORY_OVERFLOW, HIP_GENTLE_WEAK_PEAK,
-    HIP_GENTLE_HOLDING, HIP_GENTLE_RESUMED
+    HIP_GENTLE_WAITING_CROSSING = 0, HIP_GENTLE_INVALID_ANGLE = 1, HIP_GENTLE_TIMESTAMP_RESET = 2,
+    HIP_GENTLE_QUIET = 4, HIP_GENTLE_NO_PROGRESS = 5, HIP_GENTLE_EVENT_SEED = 9,
+    HIP_GENTLE_INVALID_TRACKER = 10, HIP_GENTLE_EVENT_MISMATCH = 13,
+    HIP_GENTLE_WAITING_FIRST_PEAK = 19, HIP_GENTLE_HALF_ANCHORED, HIP_GENTLE_LOW_CADENCE,
+    HIP_GENTLE_RESONANCE, HIP_GENTLE_INVALID_GEAR_LIMIT
 } hip_gentle_reason_t;
 
+typedef enum {
+    HIP_GENTLE_RAPID_OFF = 0, HIP_GENTLE_RAPID_POSITIVE = 1, HIP_GENTLE_RAPID_NEGATIVE = 2
+} hip_gentle_rapid_channel_t;
+
 typedef struct {
-    double amplitude_nm, torque_limit_nm, start_angle_rad, derivative_window_s;
-    double startup_lift_angle_rad, startup_lift_speed_rad_s, startup_lift_confirm_s;
-    double extension_torque_ratio;
-    double min_frequency_hz, max_frequency_hz;
-    double quiet_speed_rad_s, quiet_duration_s, peak_drop_ratio;
-    double hold_confirm_s, hold_range_rad;
-    double low_speed_release_confirm_s;
-    double reversal_speed_rad_s, reversal_confirm_s;
-    uint32_t weak_half_cycles;
-    bool weak_peak_stop_enabled;
-    double progress_timeout_s;
-    bool tracking_error_stop_enabled;
-    double tracking_error_rad, tracking_error_duration_s;
-    double phase_error_limit_rad, phase_correction_rad_s;
-    double slew_nm_s, reset_gap_s;
-    double motion_rise_s, motion_fall_s;
-    double width, asymmetry, response, inner_rise_s, outer_rise_s;
-    double amplitude_gain, phase_gain, frequency_gain, bias_gain;
-    bool adaptive_enabled;
-    double adaptive_max_nm, swing_up_threshold_rad, swing_down_threshold_rad;
-    double amplitude_increase_nm_s, amplitude_decrease_nm_s;
+    float response, width, asymmetry;
+    float gear_limit_nm; // 当前档位的每侧力矩上限 (N·m)，须为非负有限值
+    bool zero_cross_latch, supervision_scale, sync_peak_amplitude, low_cadence_exit;
+    float afo_phase_offset_rad; // §4.1 输出相位偏置，默认 0
+    bool extended_timing, geometric_phase_pull; // §5.2 扩展时限和可选几何牵引
+    bool reversal_envelope; // 可选角差退缩包络；舒缓默认只观测
+    float amp_scale_min_rad, amp_scale_full_rad; // 步幅力矩上限 S 曲线起止角差幅值 (rad)
+    bool amp_zero_cross_latch; // true=波形过零点锁存步幅上限，保持单半步曲线形状不变
+    bool early_stop_enable; // true=开启早峰回落停步快退（半步刹车回落时提前退出并短暂冷却）
 } hip_gentle_parameters_t;
 
 typedef struct {
     double left_torque_nm, right_torque_nm;
     hip_gentle_state_id_t state;
     hip_gentle_reason_t reason;
-    double phase_rad, frequency_hz, signal_rad, reconstructed_rad, gate;
+    double phase_rad, frequency_hz, signal_rad, reconstructed_rad, gate; // signal_rad 为原始角差，重构值已去零偏
     double swing_amplitude_rad; // 角度差第一谐波幅值绝对值，不是米制步长
-    double target_left_torque_nm;  // 限速前目标，正常停止当帧即清零
+    double target_left_torque_nm;  // 波形经首步守卫和监督后的髋侧目标
     double target_right_torque_nm;
-    double adaptive_amplitude_nm; // 诊断：当前平滑波形幅值，N·m，非反馈力矩
+    double adaptive_amplitude_nm; // 当前锁存的波形幅值，N·m
+    double carrier_nm; // 髋通道关闭时仍可读取有符号载体
+    double filtered_frequency_hz, characteristic_velocity_rad_s; // §4.2 低通后的 ω/(2π)、ωα₁
 } hip_gentle_output_t;
 
 typedef struct {
-    double time_s, left_rad, right_rad;
-} hip_gentle_history_t;
+    float eta_alpha, nu_phi, gamma_omega, eta_0;
+} hip_gentle_afo_gains_t;
+
+typedef struct {
+    bool enabled;
+    float omega, omega_filt, velocity_filt_rad_s;
+    float d_omega, d_alpha0, d_alpha[5], d_phi[5]; // 上一积分子步的导数
+    float alpha0, alpha[5], phi[5], phase_offset_rad, phase_out, y_hat; // 角度、幅值、重构均为 rad
+} hip_gentle_afo_t;
+
+typedef struct {
+    hip_gentle_state_id_t state;
+    hip_gentle_reason_t reason;
+    int32_t evt;
+    int32_t prev_evt;
+    double evt_ts[9];
+    bool evt_ts_valid[9];
+    double state_enter_ts;
+    double static_l_since, static_r_since; // <0 表示当前超出各腿静止带
+    double still_l_since, still_r_since; // <0 表示当前超出双侧真静止带
+    float prev_y;
+    float ma_buf[HIP_GENTLE_DY_WINDOW];
+    uint8_t ma_idx;
+    float dy_ma;
+    float prev_dy_ma;
+    float max_dy_pos;
+    float min_dy_neg;
+    float decel_acc;
+    float geo_decel_init;
+    float geo_phi_anchor;
+    bool return_rebounded; // 回落越阈后重新明显外摆，沿用实测过零观察时限
+    bool reacquiring_speed; // 双支撑凹陷解除后允许重新建立本半步速度参考
+    hip_gentle_rapid_channel_t rapid_channel; // 跨回阈值或过零后清除
+    float phi_ref;
+    float seed_peak_pos;
+    float seed_peak_neg;
+    bool peak_pos_seen;
+    bool peak_neg_seen;
+    float half_period_s, peak_fade_s;
+    float reference_half_s;
+    float reference_peak_deg[2];  // 分侧记住稳定半步摆幅，避免把左右不对称当作收步
+    unsigned short_halves;
+    float high_cadence_elapsed;
+    float dir_sign;
+    bool phase_override_valid;
+    float fsm_phase;
+    float scale_timeout;
+    float scale_env, lockin_gain;
+    float rise_ref_deg_s, fall_ref_deg_s;
+    float dyn_to_coeff;
+    float amp_confidence;
+    float recent_peak_rad; // 最近实测半步摆幅峰值 (rad)，用于步幅上限快降慢升
+    bool abrupt_shrink_resonance; // 单半步突发大幅缩幅+缩时共振标志
+    float low_cadence_elapsed;
+    uint32_t step_count;
+    bool prev_y_valid;
+    double observed_zero_ts[2], half_start_ts;
+    bool observed_zero_valid[2];
+    int half_start_sign;
+    bool early_peak_armed; // 检测到明显早峰+缩幅后挂起，等待回落确认停步
+    int early_peak_sign; // 挂起半步方向 (+1 正半步 / -1 负半步)
+    float early_peak_deg, early_peak_ref_deg; // 挂起时实测峰值与同侧参考步幅 (deg)
+    float cooldown_min_s; // 普通冷却态允许过零回 IDLE 前的最短保持时长 (s)
+} hip_gentle_fsm_t;
+
+typedef struct {
+    float gear_ramp_nm, prev_zero_sig, resp_ramp;
+    float ramp_inner, ramp_outer, amplitude_nm, carrier_nm, target_nm, release_rate_nm_s;
+    float amp_scale_latched, prev_wave_shape;
+    bool amp_scale_valid;
+} hip_gentle_torque_t;
 
 typedef struct {
     hip_gentle_parameters_t parameters;
-    bool initialized, has_timestamp, bootstrap_pending;
-    bool startup_reference_valid, startup_released, startup_second_confirmed;
-    bool collect_wait_cycle, collect_has_zero;
-    double collect_zero_time;
-    uint8_t startup_first_leg; // 0未确认，1左腿，2右腿；正式退出/复位后重新识别
-    double startup_min_angle[2], startup_lift_time[2];
-    uint32_t timestamp_ms, history_head, history_count, weak_count;
-    hip_gentle_state_id_t state;
-    hip_gentle_state_id_t pause_from_state;
-    hip_gentle_reason_t reason;
-    int direction;
-    int torque_direction, motion_direction; // 公共力矩已允许方向、实测角度差运动候选方向
-    int completed_direction; // 已结束的相位出力方向；临时卸力不视作结束
-    int paused_direction; // 临时卸力不消费当前相位段；同向恢复需有新的实际位移
-    double paused_x;
-    bool motion_waiting; // 低速卸力后的许可等待，不等于正式退出或暂停整个振荡器
-    bool motion_releasing;
-    bool motion_ramp_pending;
-    int requested_direction;
-    double direction_wait_s; // 等实际方向许可的时间，不含正常跨零卸力
-    bool phase_paused, pause_used_this_half; // 短停与长HOLD共用暂停状态；每半波限制短停重入
-    double motion_entry_elapsed, motion_release_elapsed, motion_release_duration, motion_release_torque;
-    bool motion_release_resumable, motion_release_reversing;
-    double motion_release_x, motion_entry_torque, motion_release_hold_s; // 保持结束时刻相对本次卸力起点，s
-    double torque_rate_nm_s, motion_release_rate; // 卸力衔接保留已有的回零速度
-    double time_s, previous_x, peak, last_peak, cross_time, peak_time, event_time;
-    double progress_time, progress_x;
-    bool progress_returning;
-    bool weak_pending; // 局部弱峰回摆：仅卸力，等待同半波继续增大或确认结束
-    double hold_quiet_time, pause_anchor_x;
-    double hold_low[3], hold_high[3]; // 左腿、右腿、角度差的候选稳定范围
-    bool pause_zeroed;
-    bool relearn_peaks_after_hold;
-    bool resume_cross_seen;
-    uint8_t resume_sync_remaining, bootstrap_halves_remaining;
-    double resume_cross_time;
-    double recent_peaks[2][HIP_GENTLE_PEAK_HISTORY_CAPACITY];
-    uint32_t recent_peak_head[2], recent_peak_count[2];
-    double restart_angle_rad, cross_angle_rad; // 弱峰退出后抑制残余摆动；记录本次实际越阈值角度
-    double quiet_time, bad_time, enabled_time, phase_correction;
-    double motion_confirm_time;
-    double target, torque, phase, gate, estimate, bias, omega;
-    double adaptive_amplitude_nm;
-    bool adaptive_high; // 当前目标档位，与平滑过渡中的实际幅值分开
-    double amplitudes[HIP_GENTLE_HARMONICS], phases[HIP_GENTLE_HARMONICS], rates[12];
-    hip_gentle_history_t history[HIP_GENTLE_HISTORY_CAPACITY];
+    bool initialized, enabled, hip_enabled, have_sample;
+    uint32_t timestamp_ms;
+    double gait_time_s;
+    float previous_left, previous_right, left_speed, right_speed;
+    float idle_offset_rad; // 仅在 IDLE 双髋静止时更新；AFO 和事件检测共用校正输入
+    hip_gentle_afo_t afo;
+    hip_gentle_afo_gains_t afo_gains;
+    hip_gentle_fsm_t fsm;
+    hip_gentle_torque_t torque;
 } hip_gentle_assist_t;
 
+void hip_gentle_default_parameters(hip_gentle_parameters_t *parameters);
 bool hip_gentle_init(hip_gentle_assist_t *state, const hip_gentle_parameters_t *parameters);
 void hip_gentle_reset(hip_gentle_assist_t *state);
-/* 100Hz 每帧一次，timestamp_ms 应为实际单调时钟。无效数据返回 false 且清零。
- * 周期重复/倒退/超期则复位并返回有效的零输出，等待新的越阈值事件。
- * 两侧输入须零位正确、同以屈曲为正。左右反号输出为本机适配设计。 */
+/* 控制任务在两帧之间调节。四个百分比依次对应 eta_alpha、nu_phi、gamma_omega、eta_0。
+ * trim_percent 为 NULL 时各通道微调为 0。无效输入返回 false，保留上次增益。 */
+bool hip_gentle_set_afo_gains(hip_gentle_assist_t *state, float global_scale,
+                               const float trim_percent[4]);
+/* 为当前外摆半周选择一次急换向通道，传 OFF 撤销。 */
+bool hip_gentle_set_rapid_channel(hip_gentle_assist_t *state, hip_gentle_rapid_channel_t channel);
+void hip_gentle_set_enable(hip_gentle_assist_t *state, bool enabled, bool hip_enabled);
+void hip_gentle_set_response_speed(hip_gentle_assist_t *state, float response);
+/* 每帧入口：gear_limit_nm 立即作用于本帧。传 0 时两侧零出力；无效上限使本帧失败并清零。 */
+bool hip_gentle_step(hip_gentle_assist_t *state, double left_rad, double right_rad,
+                     double left_rad_s, double right_rad_s, uint32_t timestamp_ms,
+                     bool valid, float gear_limit_nm, hip_gentle_output_t *output);
+
+/* 分开设档和更新的调用方式也可使用以下三个接口。
+ * 初始化后或两帧之间换档；不重置步态。0 表示零力矩。负值或非有限值清零并返回 false。
+ * 下一帧起每侧指令绝对值不超过本档上限，正常卸力期间同样生效。reset 保留所选档位。 */
+bool hip_gentle_set_gear_limit_nm(hip_gentle_assist_t *state, float gear_limit_nm);
+bool hip_gentle_update_with_velocity(hip_gentle_assist_t *state, double left_rad, double right_rad,
+                                     double left_rad_s, double right_rad_s, uint32_t timestamp_ms,
+                                     bool valid, hip_gentle_output_t *output);
 bool hip_gentle_update(hip_gentle_assist_t *state, double left_rad, double right_rad,
-                      uint32_t timestamp_ms, bool valid, hip_gentle_output_t *output);
-/* 单位幅值形状；无效参数返回 NAN。 */
+                       uint32_t timestamp_ms, bool valid, hip_gentle_output_t *output);
+/* 归一化波形，phase 为包含响应偏移的步态相位。 */
 double hip_gentle_waveform(double phase, double width, double asymmetry);
 
+#ifdef __cplusplus
+}
+#endif
 #endif
