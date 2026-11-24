@@ -50,6 +50,14 @@ extern "C" {
 #define HIP_GENTLE_AMP_CONF_RISE_TAU_S     0.15f /* 步幅增大时上限置信度慢升滤波时间常数 (s) */
 #define HIP_GENTLE_AMP_CONF_FALL_TAU_S     0.06f /* 步幅减小时上限置信度快降滤波时间常数 (s) */
 #define HIP_GENTLE_AMP_ZERO_CROSS_LATCH    true  /* true=仅在波形过零点锁存步幅上限（单半步保形），false=逐帧实时缩放 */
+#define HIP_GENTLE_ENERGY_MIN_REF_DEG      10.0f /* 相平面步幅能量比参考幅值下限 (deg) */
+#define HIP_GENTLE_ENERGY_RATIO_HI         0.65f /* 相平面步幅能量比开始平滑衰减门槛（>=此值不衰减） */
+#define HIP_GENTLE_ENERGY_RATIO_LO         0.25f /* 相平面步幅能量比达到最低倍率门槛 */
+#define HIP_GENTLE_ENERGY_SCALE_FLOOR      0.20f /* 相平面步幅能量塌缩时的最低平滑缩放倍率 */
+#define HIP_GENTLE_ENERGY_AMP_RISE_TAU_S   0.08f /* 瞬时相平面幅值上升低通时间常数 (s) */
+#define HIP_GENTLE_ENERGY_AMP_FALL_TAU_S   0.04f /* 瞬时相平面幅值下降快跟时间常数 (s) */
+#define HIP_GENTLE_ENERGY_SCALE_RISE_TAU_S 0.08f /* 能量缩放倍率恢复时间常数 (s) */
+#define HIP_GENTLE_ENERGY_SCALE_FALL_TAU_S 0.04f /* 能量缩放倍率下降时间常数 (s) */
 
 
 /* ==================== 五、五谐波 AFO 振荡器参数 ==================== */
@@ -119,6 +127,10 @@ extern "C" {
 #define HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG    33.0f /* 触发早峰挂起的本次峰值角差上限 (deg) */
 #define HIP_GENTLE_EARLY_STOP_PEAK_RATIO      0.65f /* 触发早峰挂起相对同侧参考峰值的比例上限 */
 #define HIP_GENTLE_EARLY_STOP_PHASE_LEAD_DEG  18.0f /* 触峰相对 90/270 deg 的最小提前相位角 (deg) */
+#define HIP_GENTLE_EARLY_STOP_SEVERE_RATIO    0.45f /* 单半步严重缩幅（相对参考峰值）放宽相位提前门槛的比例上限 */
+#define HIP_GENTLE_EARLY_STOP_SEVERE_LEAD_DEG 5.0f  /* 单半步严重缩幅时所需的最小提前相位角 (deg) */
+#define HIP_GENTLE_COLLAPSE_PEAK_RATIO        0.55f /* 连续两半步大幅缩幅（不要求缩时）的相对参考峰值比例上限 */
+#define HIP_GENTLE_COLLAPSE_CONFIRM_HALVES    2U    /* 连续大幅缩幅触发共振冷却的半步数门槛 */
 #define HIP_GENTLE_EARLY_STOP_FALL_DEG        6.0f  /* 早峰挂起后确认收腿退出所需的角差回落量 (deg) */
 #define HIP_GENTLE_EARLY_STOP_STILL_S         0.10f /* 早峰挂起后双腿真静止确认停步退出时长 (s) */
 #define HIP_GENTLE_EARLY_STOP_COOLDOWN_S      0.50f /* 早峰停步退出后的最短冷却防反抽时长 (s) */
@@ -218,7 +230,9 @@ typedef struct {
     float dyn_to_coeff;
     float amp_confidence;
     float recent_peak_rad; // 最近实测半步摆幅峰值 (rad)，用于步幅上限快降慢升
+    float phase_amp_filt_rad, scale_energy; // 相平面瞬时步幅低通估计 (rad) 与步幅能量塌缩平滑倍率
     bool abrupt_shrink_resonance; // 单半步突发大幅缩幅+缩时共振标志
+    uint8_t collapse_halves; // 连续大幅缩幅（不要求缩时）的半步计数
     float low_cadence_elapsed;
     uint32_t step_count;
     bool prev_y_valid;

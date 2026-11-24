@@ -153,7 +153,7 @@ static void fsm_reset_to_idle(hip_gentle_fsm_t *fsm, hip_gentle_afo_t *afo, doub
     fsm->half_period_s = 0.5f;
     fsm->static_l_since = fsm->static_r_since = -1.0;
     fsm->still_l_since = fsm->still_r_since = -1.0;
-    fsm->scale_timeout = fsm->scale_env = 1.0f;
+    fsm->scale_timeout = fsm->scale_env = fsm->scale_energy = 1.0f;
     fsm->dyn_to_coeff = HIP_GENTLE_DYN_TO_FAST_COEFF;
 }
 
@@ -167,7 +167,10 @@ static void fsm_enter_cooldown(hip_gentle_fsm_t *fsm, hip_gentle_afo_t *afo, dou
     fsm->phase_override_valid = false;
     fsm->dir_sign = 0.0f;
     fsm->recent_peak_rad = 0.0f;
+    fsm->phase_amp_filt_rad = 0.0f;
+    fsm->scale_energy = 1.0f;
     fsm->abrupt_shrink_resonance = false;
+    fsm->collapse_halves = 0U;
     fsm->early_peak_armed = false;
     fsm->early_peak_sign = 0;
     fsm->early_peak_deg = 0.0f;
@@ -200,7 +203,9 @@ static float observe_half_period(hip_gentle_fsm_t *fsm, int sign)
         measured = (float)(cross - fsm->half_start_ts);
         /* 过正零点刚完成负半波，过负零点刚完成正半波。 */
         float peak = sign > 0 ? -fsm->seed_peak_neg : fsm->seed_peak_pos;
-        float *reference = &fsm->reference_peak_deg[sign > 0 ? 1 : 0];
+        unsigned ref_idx = sign > 0 ? 1U : 0U;
+        float *reference = &fsm->reference_peak_deg[ref_idx];
+        float eff_ref = fmaxf(*reference, fsm->last_peak_deg[ref_idx]);
         bool shrinking = *reference > HIP_GENTLE_START_THRESHOLD_DEG &&
             peak < HIP_GENTLE_SHRINK_PEAK_MAX_DEG && peak < HIP_GENTLE_SHRINK_PEAK_RATIO * *reference;
         bool contracting = measured < HIP_GENTLE_SHORT_HALF_S ||
@@ -214,7 +219,13 @@ static float observe_half_period(hip_gentle_fsm_t *fsm, int sign)
             ++fsm->short_halves;
         else
             fsm->short_halves = 0;
-        if (!fsm->short_halves && peak > HIP_GENTLE_START_THRESHOLD_DEG) {
+        if (eff_ref >= HIP_GENTLE_EARLY_STOP_MIN_REF_DEG &&
+            peak < HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG &&
+            peak < HIP_GENTLE_COLLAPSE_PEAK_RATIO * eff_ref)
+            ++fsm->collapse_halves;
+        else
+            fsm->collapse_halves = 0U;
+        if (!fsm->short_halves && !fsm->collapse_halves && peak > HIP_GENTLE_START_THRESHOLD_DEG) {
             *reference = *reference > 0.0f ? *reference + HIP_GENTLE_REF_ADAPT_ALPHA * (peak - *reference) : peak;
             fsm->reference_half_s = fsm->reference_half_s > 0.0f
                 ? fsm->reference_half_s + HIP_GENTLE_REF_ADAPT_ALPHA * (measured - fsm->reference_half_s) : measured;
@@ -616,6 +627,32 @@ static void update_supervisors(hip_gentle_assist_t *s, float y_deg, float dt)
                                             s->parameters.amp_scale_full_rad);
     float amp_tau = confidence > f->amp_confidence ? HIP_GENTLE_AMP_CONF_RISE_TAU_S : HIP_GENTLE_AMP_CONF_FALL_TAU_S;
     f->amp_confidence += dt / (amp_tau + dt) * (confidence - f->amp_confidence);
+
+    /* 相平面瞬时步幅能量比：正常行走与叉腿停顿保持 ~1.0，停步减速时在最后半步即平滑减幅 */
+    if (f->state == HIP_GENTLE_STEADY) {
+        float w_eff = fmaxf(HIP_GENTLE_AFO_MIN_OMEGA_RAD_S,
+                            s->afo.omega_filt > 1.0f ? s->afo.omega_filt : s->afo.omega);
+        float v_term = (f->dy_ma * HIP_DEG_TO_RAD) / w_eff;
+        float r_inst = sqrtf(abs_y_rad * abs_y_rad + v_term * v_term);
+        float r_tau = r_inst > f->phase_amp_filt_rad
+            ? HIP_GENTLE_ENERGY_AMP_RISE_TAU_S : HIP_GENTLE_ENERGY_AMP_FALL_TAU_S;
+        f->phase_amp_filt_rad += dt / (r_tau + dt) * (r_inst - f->phase_amp_filt_rad);
+        unsigned cur_side = f->evt < 4 ? 0U : 1U;
+        float side_ref_rad = fmaxf(f->reference_peak_deg[cur_side], f->last_peak_deg[cur_side]) * HIP_DEG_TO_RAD;
+        float ref_r = fmaxf(fmaxf(amp_afo, side_ref_rad), HIP_GENTLE_ENERGY_MIN_REF_DEG * HIP_DEG_TO_RAD);
+        float rho = f->phase_amp_filt_rad / ref_r;
+        float u_rho = clampf((rho - HIP_GENTLE_ENERGY_RATIO_LO) /
+                             fmaxf(HIP_GENTLE_ENERGY_RATIO_HI - HIP_GENTLE_ENERGY_RATIO_LO, 1e-4f),
+                             0.0f, 1.0f);
+        float tgt_energy = HIP_GENTLE_ENERGY_SCALE_FLOOR +
+                           (1.0f - HIP_GENTLE_ENERGY_SCALE_FLOOR) * (u_rho * u_rho * (3.0f - 2.0f * u_rho));
+        float e_tau = tgt_energy > f->scale_energy
+            ? HIP_GENTLE_ENERGY_SCALE_RISE_TAU_S : HIP_GENTLE_ENERGY_SCALE_FALL_TAU_S;
+        f->scale_energy += dt / (e_tau + dt) * (tgt_energy - f->scale_energy);
+    } else {
+        f->phase_amp_filt_rad = fmaxf(f->recent_peak_rad, abs_y_rad);
+        f->scale_energy = 1.0f;
+    }
 }
 
 static void fsm_enter_lock_in(hip_gentle_assist_t *s, double now, float quarter_s,
@@ -634,8 +671,10 @@ static void fsm_enter_lock_in(hip_gentle_assist_t *s, double now, float quarter_
     f->amp_confidence = amplitude_confidence(f->recent_peak_rad,
                                              s->parameters.amp_scale_min_rad,
                                              s->parameters.amp_scale_full_rad);
+    f->phase_amp_filt_rad = f->recent_peak_rad;
     f->abrupt_shrink_resonance = false;
-    f->scale_timeout = f->scale_env = 1.0f;
+    f->collapse_halves = 0U;
+    f->scale_timeout = f->scale_env = f->scale_energy = 1.0f;
     float mode_scale = s->parameters.extended_timing ? 1.5f : 1.0f;
     f->peak_fade_s = (2.0f/3.0f)*clampf(f->half_period_s*mode_scale, 0.5f, 1000.0f);
     afo_hot_start(s, HIP_PI/f->half_period_s, peak_deg*HIP_DEG_TO_RAD, f->fsm_phase, y_deg*HIP_DEG_TO_RAD);
@@ -699,7 +738,9 @@ static void fsm_handle_lock_in(hip_gentle_assist_t *s, float y_deg, double now, 
         f->state_enter_ts = now;
         f->dir_sign = 0.0f;
         f->phase_override_valid = false;
-        f->scale_timeout = 1.0f;
+        f->scale_timeout = f->scale_energy = 1.0f;
+        f->phase_amp_filt_rad = fmaxf(0.0f, peak_deg) * HIP_DEG_TO_RAD;
+        f->collapse_halves = 0U;
         f->phi_ref = s->afo.phase_out;
     } else {
         fsm_reset_to_idle(f, &s->afo, now);
@@ -771,11 +812,14 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
             float ref_peak = fmaxf(f->reference_peak_deg[ref_side], f->last_peak_deg[ref_side]);
             float expected_phase = base == 0U ? HIP_HALF_PI : HIP_THREE_HALF_PI;
             float phase_err_deg = wrap_pm_pi(a->phi[0] - expected_phase) * HIP_RAD_TO_DEG;
+            bool early_lead = phase_err_deg < -HIP_GENTLE_EARLY_STOP_PHASE_LEAD_DEG ||
+                              (peak_deg < HIP_GENTLE_EARLY_STOP_SEVERE_RATIO * ref_peak &&
+                               phase_err_deg < -HIP_GENTLE_EARLY_STOP_SEVERE_LEAD_DEG);
             if (s->parameters.early_stop_enable &&
                 ref_peak >= HIP_GENTLE_EARLY_STOP_MIN_REF_DEG &&
                 peak_deg < HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG &&
                 peak_deg < HIP_GENTLE_EARLY_STOP_PEAK_RATIO * ref_peak &&
-                phase_err_deg < -HIP_GENTLE_EARLY_STOP_PHASE_LEAD_DEG) {
+                early_lead) {
                 f->early_peak_armed = true;
                 f->early_peak_sign = base == 0U ? 1 : -1;
                 f->early_peak_deg = peak_deg;
@@ -809,7 +853,9 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
                 f->half_period_s = clampf(measured, HIP_GENTLE_MIN_HALF_PERIOD_S, HIP_GENTLE_MAX_HALF_PERIOD_S);
                 a->omega = bounded_anchor(a->omega, f->half_period_s);
                 afo_refresh_rates(a, &s->afo_gains, signal);
-                if (f->abrupt_shrink_resonance || f->short_halves >= HIP_GENTLE_SHRINK_CONFIRM_HALVES) {
+                if (f->abrupt_shrink_resonance ||
+                    f->short_halves >= HIP_GENTLE_SHRINK_CONFIRM_HALVES ||
+                    f->collapse_halves >= HIP_GENTLE_COLLAPSE_CONFIRM_HALVES) {
                     fsm_enter_cooldown(f, a, now);
                     f->reason = HIP_GENTLE_RESONANCE;
                     return;
@@ -1031,7 +1077,7 @@ static void update_torque(hip_gentle_assist_t *s, float y_deg, float dt)
     t->prev_wave_shape = shape;
     if (p->supervision_scale) {
         float amp_scale = p->amp_zero_cross_latch ? t->amp_scale_latched : fsm->amp_confidence;
-        carrier *= fsm->scale_timeout * amp_scale; // 本机保留小幅与超时保护
+        carrier *= fsm->scale_timeout * amp_scale * fsm->scale_energy; // 本机保留小幅、相平面能量塌缩与超时保护
         if (p->reversal_envelope) carrier *= fsm->scale_env;
     }
     t->target_nm = clampf(carrier, -p->gear_limit_nm, p->gear_limit_nm);
