@@ -25,8 +25,8 @@ extern "C" {
 /* ==================== 二、默认助力与波形参数 ==================== */
 #define HIP_GENTLE_DEFAULT_RESPONSE          0.0f   /* 默认响应超前/滞后调节值 [0, 100]（越大越超前，越小越偏向屈曲托举、伸展柔和） */
 #define HIP_GENTLE_DEFAULT_WIDTH             1.04f   /* 升余弦波形占空/脉宽参数 [0.1, 2.0] */
-#define HIP_GENTLE_DEFAULT_ASYMMETRY         (-0.02f)/* 升余弦波形非对称偏置 (-1, 1) */
-#define HIP_GENTLE_DEFAULT_PHASE_OFFSET_RAD  0.0f    /* AFO 输出相位附加偏置 (rad) */
+#define HIP_GENTLE_DEFAULT_ASYMMETRY         (0.00f)/* 升余弦波形非对称偏置 (-1, 1) */
+#define HIP_GENTLE_DEFAULT_PHASE_OFFSET_RAD  -0.15f    /* AFO 输出相位附加偏置 (rad) */
 #define HIP_GENTLE_DEFAULT_ZERO_CROSS_LATCH  false   /* true=角差过零时锁存升档幅值，降档总是立即限幅 */
 #define HIP_GENTLE_DEFAULT_SUPERVISION_SCALE true    /* 默认开启小幅与超时监督缩放 */
 #define HIP_GENTLE_DEFAULT_SYNC_PEAK_AMP     false   /* 是否在 STEADY 波峰处硬同步 AFO 直流/幅值 */
@@ -85,7 +85,13 @@ extern "C" {
 #define HIP_GENTLE_MIN_RETURN_LIMIT_S      0.15f  /* 峰后回程区 (evt=3/7) 超时监督最小保底时限 (s) */
 #define HIP_GENTLE_STILL_SPEED_RAD_S       0.35f  /* 真静止检测速度死区 (rad/s，约 20.1 deg/s) */
 #define HIP_GENTLE_NARROW_STOP_DEG         15.0f  /* 并腿窄站姿快退判定角差上限 (deg) */
-#define HIP_GENTLE_NARROW_STOP_STATIC_S    0.22f  /* 并腿窄站姿双侧真静止快退确认时长 (s) */
+#define HIP_GENTLE_NARROW_STOP_STATIC_S    0.22f  /* 并腿窄站姿双侧真静止快退确认时长上限 (s) */
+#define HIP_GENTLE_NARROW_STOP_MIN_S       0.06f  /* 并腿中段/快踏步自适应静止快退确认时长下限 (s) */
+#define HIP_GENTLE_NARROW_STOP_HALF_RATIO  0.25f  /* 并腿中段/快踏步静止快退时长占当前半周期比例 */
+#define HIP_GENTLE_STOP_MID_AMP_RATIO      0.45f  /* 判定步幅中段并腿区相对 AFO 幅值的角差比例上限（避开慢走波峰） */
+#define HIP_GENTLE_FAST_STOP_OMEGA_RAD_S   7.5f   /* 高步频快踏步急停保护角频率门槛 (rad/s，约 143 步/分) */
+#define HIP_GENTLE_AFO_FREEZE_MIN_DEG_S    2.0f   /* 中段/快踏步 AFO 随腿速冻结下限 (deg/s，<=此值 AFO 立即停转) */
+#define HIP_GENTLE_AFO_FREEZE_FULL_DEG_S   12.0f  /* 中段/快踏步 AFO 全速积分上限 (deg/s，>=此值 AFO 正常积分) */
 #define HIP_GENTLE_PEAK_FADE_S             0.20f  /* 峰/谷超时后预淡出持续窗口 (s) */
 #define HIP_GENTLE_MIN_PEAK_FADE_S         1.30f  /* STEADY 峰/谷保持预淡出前最小保底时长 (s，加 0.20 s 淡出约 1.50 s) */
 #define HIP_GENTLE_MIN_HALF_PERIOD_S       0.25f  /* 状态机步态半周期下限钳位 (s) */
@@ -110,10 +116,11 @@ extern "C" {
 #define HIP_GENTLE_REF_ADAPT_ALPHA            0.15f /* 正常步幅与半周期参考值的指数更新系数 */
 #define HIP_GENTLE_EARLY_STOP_ENABLE          true  /* true=开启早峰回落停步快退（识别半步刹车后收腿） */
 #define HIP_GENTLE_EARLY_STOP_MIN_REF_DEG     28.0f /* 启用早峰停步判定的同侧参考步幅下限 (deg) */
-#define HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG    30.0f /* 触发早峰挂起的本次峰值角差上限 (deg) */
+#define HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG    33.0f /* 触发早峰挂起的本次峰值角差上限 (deg) */
 #define HIP_GENTLE_EARLY_STOP_PEAK_RATIO      0.65f /* 触发早峰挂起相对同侧参考峰值的比例上限 */
 #define HIP_GENTLE_EARLY_STOP_PHASE_LEAD_DEG  18.0f /* 触峰相对 90/270 deg 的最小提前相位角 (deg) */
 #define HIP_GENTLE_EARLY_STOP_FALL_DEG        6.0f  /* 早峰挂起后确认收腿退出所需的角差回落量 (deg) */
+#define HIP_GENTLE_EARLY_STOP_STILL_S         0.10f /* 早峰挂起后双腿真静止确认停步退出时长 (s) */
 #define HIP_GENTLE_EARLY_STOP_COOLDOWN_S      0.50f /* 早峰停步退出后的最短冷却防反抽时长 (s) */
 
 typedef enum {
@@ -221,6 +228,7 @@ typedef struct {
     bool early_peak_armed; // 检测到明显早峰+缩幅后挂起，等待回落确认停步
     int early_peak_sign; // 挂起半步方向 (+1 正半步 / -1 负半步)
     float early_peak_deg, early_peak_ref_deg; // 挂起时实测峰值与同侧参考步幅 (deg)
+    float last_peak_deg[2]; // 分侧记录最近一次正常 STEADY 峰值 (deg)，防止短距步行 reference_peak_deg 滞后
     float cooldown_min_s; // 普通冷却态允许过零回 IDLE 前的最短保持时长 (s)
 } hip_gentle_fsm_t;
 

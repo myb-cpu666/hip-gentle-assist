@@ -172,6 +172,7 @@ static void fsm_enter_cooldown(hip_gentle_fsm_t *fsm, hip_gentle_afo_t *afo, dou
     fsm->early_peak_sign = 0;
     fsm->early_peak_deg = 0.0f;
     fsm->early_peak_ref_deg = 0.0f;
+    fsm->last_peak_deg[0] = fsm->last_peak_deg[1] = 0.0f;
     fsm->cooldown_min_s = 0.0f;
     fsm->state_enter_ts = now;
 }
@@ -295,10 +296,20 @@ static bool fsm_both_still_for(const hip_gentle_fsm_t *f, double now, float dura
     return both_since_for(f->still_l_since, f->still_r_since, now, duration_s);
 }
 
-static bool fsm_narrow_stopped(const hip_gentle_fsm_t *f, float y_deg, double now)
+static bool fsm_narrow_stopped(const hip_gentle_fsm_t *f, const hip_gentle_afo_t *a,
+                               float y_deg, double now)
 {
-    return fabsf(y_deg) <= HIP_GENTLE_NARROW_STOP_DEG &&
-           fsm_both_still_for(f, now, HIP_GENTLE_NARROW_STOP_STATIC_S);
+    float amp_deg = fabsf(a->alpha[0]) * HIP_RAD_TO_DEG;
+    bool near_mid = fabsf(y_deg) <= HIP_GENTLE_NARROW_STOP_DEG &&
+                    fabsf(y_deg) <= HIP_GENTLE_STOP_MID_AMP_RATIO * amp_deg;
+    bool high_cadence = a->enabled && a->omega_filt >= HIP_GENTLE_FAST_STOP_OMEGA_RAD_S;
+    float fast_s = clampf(HIP_GENTLE_NARROW_STOP_HALF_RATIO * f->half_period_s,
+                          HIP_GENTLE_NARROW_STOP_MIN_S, HIP_GENTLE_NARROW_STOP_STATIC_S);
+    if (high_cadence && fsm_both_still_for(f, now, fast_s))
+        return true;
+    if (fabsf(y_deg) <= HIP_GENTLE_NARROW_STOP_DEG)
+        return fsm_both_still_for(f, now, near_mid ? fast_s : HIP_GENTLE_NARROW_STOP_STATIC_S);
+    return false;
 }
 
 static bool fsm_track_peak_budget(hip_gentle_fsm_t *fsm,
@@ -644,7 +655,7 @@ static void fsm_handle_lock_in(hip_gentle_assist_t *s, float y_deg, double now, 
     float angle_phase = wrap_2pi(peak_phase + HIP_HALF_PI -
                            asin_safe(clampf(relative_y/fmaxf(peak_deg, 1e-3f), 0.0f, 1.0f)));
     if (fsm_both_static_for(f, now, HIP_GENTLE_ACTIVE_STATIC_S) ||
-        fsm_narrow_stopped(f, y_deg, now)) {
+        fsm_narrow_stopped(f, &s->afo, y_deg, now)) {
         fsm_reset_to_idle(f, &s->afo, now);
         f->reason = HIP_GENTLE_QUIET;
         return;
@@ -757,9 +768,9 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
             float peak_deg = base == 0U ? f->seed_peak_pos : -f->seed_peak_neg;
             f->recent_peak_rad = fmaxf(0.0f, peak_deg) * HIP_DEG_TO_RAD;
             unsigned ref_side = base == 0U ? 0U : 1U;
-            float ref_peak = f->reference_peak_deg[ref_side];
+            float ref_peak = fmaxf(f->reference_peak_deg[ref_side], f->last_peak_deg[ref_side]);
             float expected_phase = base == 0U ? HIP_HALF_PI : HIP_THREE_HALF_PI;
-            float phase_err_deg = wrap_pm_pi(a->phase_out - expected_phase) * HIP_RAD_TO_DEG;
+            float phase_err_deg = wrap_pm_pi(a->phi[0] - expected_phase) * HIP_RAD_TO_DEG;
             if (s->parameters.early_stop_enable &&
                 ref_peak >= HIP_GENTLE_EARLY_STOP_MIN_REF_DEG &&
                 peak_deg < HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG &&
@@ -771,6 +782,8 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
                 f->early_peak_ref_deg = ref_peak;
             } else {
                 f->early_peak_armed = false;
+                if (peak_deg > HIP_GENTLE_START_THRESHOLD_DEG)
+                    f->last_peak_deg[ref_side] = peak_deg;
             }
             if (s->parameters.sync_peak_amplitude && f->peak_pos_seen && f->peak_neg_seen) {
                 float dc = 0.5f*(f->seed_peak_pos + f->seed_peak_neg);
@@ -819,7 +832,8 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
         if (signed_y > HIP_GENTLE_EARLY_STOP_PEAK_RATIO * f->early_peak_ref_deg ||
             signed_y >= HIP_GENTLE_EARLY_STOP_MAX_PEAK_DEG) {
             f->early_peak_armed = false;
-        } else if (signed_y < f->early_peak_deg - HIP_GENTLE_EARLY_STOP_FALL_DEG) {
+        } else if (signed_y < f->early_peak_deg - HIP_GENTLE_EARLY_STOP_FALL_DEG ||
+                   fsm_both_still_for(f, now, HIP_GENTLE_EARLY_STOP_STILL_S)) {
             early_stop_hit = true;
         }
     }
@@ -829,7 +843,7 @@ static void fsm_handle_steady(hip_gentle_assist_t *s, float y_deg, double now, f
     f->high_cadence_elapsed = a->omega_filt > HIP_GENTLE_RESONANCE_OMEGA_RAD_S ? f->high_cadence_elapsed+dt : 0;
     f->low_cadence_elapsed = s->parameters.low_cadence_exit && a->omega_filt <= HIP_GENTLE_LOW_CADENCE_OMEGA_RAD_S ? f->low_cadence_elapsed+dt : 0;
     if (fsm_both_static_for(f, now, HIP_GENTLE_ACTIVE_STATIC_S) ||
-        fsm_narrow_stopped(f, y_deg, now)) cause = HIP_GENTLE_QUIET;
+        fsm_narrow_stopped(f, a, y_deg, now)) cause = HIP_GENTLE_QUIET;
     else if (early_stop_hit) {
         cause = HIP_GENTLE_QUIET;
         early_stop_cooldown = true;
@@ -1216,7 +1230,21 @@ static bool update(hip_gentle_assist_t *s, double l, double r, double vl, double
         observe_zero(&s->fsm, y, s->gait_time_s, dt);
         float left_deg_s = s->left_speed * HIP_RAD_TO_DEG;
         float right_deg_s = s->right_speed * HIP_RAD_TO_DEG;
-        afo_step(&s->afo, &s->afo_gains, signal_rad, dt);
+        float afo_dt = dt;
+        if (s->afo.enabled) {
+            float amp_deg = fabsf(s->afo.alpha[0]) * HIP_RAD_TO_DEG;
+            bool afo_near_mid = (fabsf(y) <= HIP_GENTLE_NARROW_STOP_DEG &&
+                                 fabsf(y) <= HIP_GENTLE_STOP_MID_AMP_RATIO * amp_deg) ||
+                                (s->afo.omega_filt >= HIP_GENTLE_FAST_STOP_OMEGA_RAD_S);
+            if (afo_near_mid) {
+                float vmax_deg_s = fmaxf(fabsf(raw_l), fabsf(raw_r)) * HIP_RAD_TO_DEG;
+                float u_mv = clampf((vmax_deg_s - HIP_GENTLE_AFO_FREEZE_MIN_DEG_S) /
+                                    fmaxf(HIP_GENTLE_AFO_FREEZE_FULL_DEG_S - HIP_GENTLE_AFO_FREEZE_MIN_DEG_S, 1e-4f),
+                                    0.0f, 1.0f);
+                afo_dt = dt * (u_mv * u_mv * (3.0f - 2.0f * u_mv));
+            }
+        }
+        afo_step(&s->afo, &s->afo_gains, signal_rad, afo_dt);
         fsm_step(s, y, left_deg_s, right_deg_s, s->gait_time_s, dt);
         update_torque(s, y, dt);
         if (!isfinite(s->afo.phase_out) || !isfinite(s->afo.y_hat) || !isfinite(s->afo.omega) ||
