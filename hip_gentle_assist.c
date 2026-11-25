@@ -1063,6 +1063,10 @@ static void update_torque(hip_gentle_assist_t *s, float y_deg, float dt)
     float phase = fsm->phase_override_valid ? fsm->fsm_phase : s->afo.phase_out;
     float offset = clampf(t->resp_ramp / 100.0f - 0.92f, -3.2f, 1.6f);
     float shape = (float)hip_gentle_waveform(phase + offset, p->width, p->asymmetry);
+    if (HIP_GENTLE_DEFAULT_WAVE_GAMMA > 1.0f && isfinite(shape)) {
+        float abs_shape = fabsf(shape);
+        shape = abs_shape > 0.0f ? copysignf(powf(abs_shape, HIP_GENTLE_DEFAULT_WAVE_GAMMA), shape) : 0.0f;
+    }
     float raw = t->amplitude_nm * shape;
     ramp_to(&t->ramp_inner, 1.0f, dt / HIP_GENTLE_INNER_RAMP_S);
     ramp_to(&t->ramp_outer, 1.0f, dt / HIP_GENTLE_OUTER_RAMP_S);

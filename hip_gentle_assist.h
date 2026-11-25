@@ -23,9 +23,10 @@ extern "C" {
 #define HIP_GENTLE_IDLE_OFFSET_TAU_S       0.50f /* 站立静止零偏慢跟踪时间常数 (s) */
 
 /* ==================== 二、默认助力与波形参数 ==================== */
-#define HIP_GENTLE_DEFAULT_RESPONSE          0.0f   /* 默认响应超前/滞后调节值 [0, 100]（越大越超前，越小越偏向屈曲托举、伸展柔和） */
+#define HIP_GENTLE_DEFAULT_RESPONSE          30.0f   /* 默认响应超前/滞后调节值 [0, 100]（越大越超前，越小越偏向屈曲托举、伸展柔和） */
 #define HIP_GENTLE_DEFAULT_WIDTH             1.04f   /* 升余弦波形占空/脉宽参数 [0.1, 2.0] */
 #define HIP_GENTLE_DEFAULT_ASYMMETRY         (0.00f)/* 升余弦波形非对称偏置 (-1, 1) */
+#define HIP_GENTLE_DEFAULT_WAVE_GAMMA        1.50f   /* 连续幂次软过零指数 [1.0, 3.0]（1.0=原升余弦，>1.0 保持曲线连续无零死区同时柔化过零区、降低下摆负功） */
 #define HIP_GENTLE_DEFAULT_PHASE_OFFSET_RAD  -0.15f    /* AFO 输出相位附加偏置 (rad) */
 #define HIP_GENTLE_DEFAULT_ZERO_CROSS_LATCH  false   /* true=角差过零时锁存升档幅值，降档总是立即限幅 */
 #define HIP_GENTLE_DEFAULT_SUPERVISION_SCALE true    /* 默认开启小幅与超时监督缩放 */
